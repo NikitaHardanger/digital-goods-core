@@ -1,0 +1,253 @@
+openapi: 3.0.3
+info:
+  title: Digital Goods Core API
+  version: 2.0.0
+  description: Мультипозиционные заказы, надёжная выдача, частичные возвраты и аудит.
+servers:
+  - url: http://localhost:3000
+paths:
+  /orders:
+    post:
+      summary: Создать идемпотентный заказ
+      description: Передайте либо items, либо legacy-поле sku.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Заказ создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '200':
+          description: Идемпотентный повтор вернул существующий заказ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404': { description: Один из SKU не найден }
+        '409': { description: Ключ идемпотентности использован с другим составом }
+  /orders/{orderId}:
+    get:
+      summary: Получить заказ с позициями и сверкой денег
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Заказ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404': { description: Заказ не найден }
+  /orders/{orderId}/history:
+    get:
+      summary: Восстановить заказ и деньги на момент времени
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: at
+          in: query
+          schema: { type: string, format: date-time }
+          description: По умолчанию текущее время.
+      responses:
+        '200':
+          description: Snapshot, рассчитанный из append-only истории
+        '404': { description: Заказ к этому моменту ещё не существовал }
+  /webhook/payment:
+    post:
+      summary: Принять webhook оплаты
+      description: Идемпотентен по event_id и дополнительно допускает только один payment на заказ.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentWebhook' }
+      responses:
+        '200':
+          description: Событие сохранено либо уже было обработано
+        '422': { description: Сумма или валюта не совпадает с заказом }
+  /providers/{provider}/issue:
+    post:
+      summary: Вызвать заглушку выдачи поставщика
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueRequest' }
+      responses:
+        '200':
+          description: Поставщик ответил успехом
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssueResponse' }
+        '409': { description: Нет остатка }
+        '503': { description: Ошибка поставщика, результат может быть неоднозначным }
+  /providers/{provider}/requests/{requestId}:
+    get:
+      summary: Сверить фактическую выдачу по request id
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Фактическая запись поставщика }
+        '404': { description: Выдача не обнаружена }
+  /admin/providers/{provider}/config:
+    post:
+      summary: Настроить отказ или недобросовестное поведение заглушки
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderConfig' }
+      responses:
+        '200': { description: Настройка применена }
+  /admin/reconciliation:
+    get:
+      summary: Найти финансовые и provider-расхождения
+      responses:
+        '200': { description: Результат автоматической сверки }
+  /admin/queue:
+    get:
+      summary: Прогресс очереди и использование лимитов
+      responses:
+        '200':
+          description: Число неоплаченных, ожидающих, обрабатываемых, выданных и возвращённых позиций
+  /admin/ledger:
+    get:
+      summary: Итоги денежных операций за период
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200': { description: Суммы payment и refund по валютам }
+  /admin/recover:
+    post:
+      summary: Возобновить доступные и просроченные задания
+      responses:
+        '200': { description: Очередь обработана }
+components:
+  parameters:
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, example: order-001 }
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema: { type: string, enum: [A, B] }
+  schemas:
+    CreateOrderRequest:
+      type: object
+      properties:
+        sku:
+          type: string
+          description: Legacy-формат заказа из одного товара.
+          example: STEAM-TOPUP-500
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            type: object
+            required: [sku]
+            properties:
+              sku: { type: string, example: STEAM-TOPUP-500 }
+              quantity: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        idempotency_key: { type: string, example: order-001 }
+      oneOf:
+        - required: [sku]
+        - required: [items]
+    Order:
+      type: object
+      required: [id, amount, currency, status, items, money]
+      properties:
+        id: { type: string, example: order-001 }
+        amount: { type: integer, example: 2490 }
+        currency: { type: string, example: RUB }
+        status:
+          type: string
+          enum: [created, payment_failed, paid, processing, completed]
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        money: { $ref: '#/components/schemas/MoneySummary' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    OrderItem:
+      type: object
+      required: [id, position, sku, provider, amount, currency, status]
+      properties:
+        id: { type: string, example: 'order-001:1' }
+        position: { type: integer, example: 1 }
+        sku: { type: string, example: STEAM-TOPUP-500 }
+        provider: { type: string, enum: [A, B] }
+        amount: { type: integer, example: 500 }
+        currency: { type: string, example: RUB }
+        status:
+          type: string
+          enum: [awaiting_payment, delivery_pending, delivering, delivered, refunded]
+        delivery_code: { type: string, nullable: true, example: A-KEY-001 }
+        last_error: { type: string, nullable: true }
+    MoneySummary:
+      type: object
+      required: [paid, delivered, refunded, pending, balanced, equation]
+      properties:
+        paid: { type: integer, example: 2490 }
+        delivered: { type: integer, example: 500 }
+        refunded: { type: integer, example: 1990 }
+        pending: { type: integer, example: 0 }
+        balanced: { type: boolean, example: true }
+        equation: { type: string, example: '2490 = 500 + 1990' }
+    PaymentWebhook:
+      type: object
+      required: [event_id, order_id, status, amount, currency, created_at]
+      properties:
+        event_id: { type: string, example: payment-001 }
+        order_id: { type: string, example: order-001 }
+        status: { type: string, enum: [paid, failed] }
+        amount: { type: integer, minimum: 0, example: 2490 }
+        currency: { type: string, minLength: 3, maxLength: 3, example: RUB }
+        created_at: { type: string, format: date-time }
+    IssueRequest:
+      type: object
+      required: [request_id, sku, order_id]
+      properties:
+        request_id: { type: string, example: 'order-001:1-v1' }
+        sku: { type: string, example: STEAM-TOPUP-500 }
+        order_id: { type: string, example: order-001 }
+    IssueResponse:
+      type: object
+      required: [status, request_id, code]
+      properties:
+        status: { type: string, enum: [ok] }
+        request_id: { type: string, example: 'order-001:1-v1' }
+        code: { type: string, example: A-KEY-001 }
+    ProviderConfig:
+      type: object
+      properties:
+        failRate: { type: number, minimum: 0, maximum: 1 }
+        timeoutRate: { type: number, minimum: 0, maximum: 1 }
+        delayMs: { type: integer, minimum: 0 }
+        duplicateRate: { type: number, minimum: 0, maximum: 1 }
+        wrongSkuRate: { type: number, minimum: 0, maximum: 1 }
+        errorAfterIssueRate: { type: number, minimum: 0, maximum: 1 }
+        duplicateNext: { type: boolean }
+        wrongSkuNext: { type: boolean }
+        errorAfterIssueNext: { type: boolean }
+        limitPerWindow: { type: integer, minimum: 1, example: 10 }
+        windowMs: { type: integer, minimum: 1, example: 60000 }
+        reset: { type: boolean }
